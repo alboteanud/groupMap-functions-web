@@ -1,9 +1,0 @@
-[{
-  "relation": ["delegate_permission/common.handle_all_urls"],
-  "target": {
-    "namespace": "android_app",
-    "package_name": "com.craiovadata.groupmap",
-    "sha256_cert_fingerprints":
-    ["05:50:55:2E:6C:81:17:1C:85:2A:0F:32:3B:FB:10:79:CB:5B:0C:91:1C:02:9B:F4:FD:08:E1:DE:17:CD:84:FD"]
-  }
-}]
