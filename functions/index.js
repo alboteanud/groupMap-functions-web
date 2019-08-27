@@ -2,162 +2,217 @@
 const functions = require('firebase-functions')
 const admin = require("firebase-admin")
 admin.initializeApp()
+
 const GROUPS = "groups"
 const USERS = "users"
 const TOKENS = "tokens"
 const REQUESTS = "requests"
 
-// 3 
+const db = admin.firestore()
+const USERS_COLLECTION = db.collection(USERS)
+const GROUPS_COLLECTION = db.collection(GROUPS)
+
 exports.setupUserInGroup = functions.firestore.document(`${USERS}/{uid}/groups/{groupId}`)
     .onCreate(async (snapshot, context) => {
         const uid = context.params.uid
         const groupId = context.params.groupId
-        const db = admin.firestore()
 
-        const banned = await db.doc(`${GROUPS}/${groupId}/banned/${uid}`).get()
-        if (banned) { return snapshot.ref.delete() }
+        const banned = await GROUPS_COLLECTION.doc(`${groupId}/banned/${uid}`).get()
+        if (banned.exists) {
+            console.log("user is banned. Delete user/groupId")
+            return snapshot.ref.delete()
+        }
 
-        const token = (await db.doc(`${USERS}/${uid}`).get()).data().token
+        const doc = await USERS_COLLECTION.doc(uid).get()
+        const token = doc.get("token")
         const userData = await getUserData(uid)
 
-        let batch = db.batch();
-        batch.set(db.doc(`${GROUPS}/${groupId}/${USERS}/${uid}`), userData, { merge: true })
-        batch.set(db.doc(`${GROUPS}/${groupId}/${TOKENS}/${uid}`), token)
-        return batch.commit()
+        let promises = []
+        if (userData) {
+            promises.push(GROUPS_COLLECTION.doc(`${groupId}/${USERS}/${uid}`).set(userData, { merge: true }))
+        }
+        if (token) {
+            promises.push(GROUPS_COLLECTION.doc(`${groupId}/${TOKENS}/${uid}`).set({ token: token }))
+        }
+        return Promise.all(promises)
     })
 
-// 6  watch out for changing token
+// user deleted from group
+exports.onUserDeleted = functions.firestore.document(`${GROUPS}/{groupId}/${USERS}/{uid}`)
+    .onDelete(async (snapshot, context) => {
+        const uid = context.params.uid
+        const groupId = context.params.groupId
+
+        let promises = []
+        promises.push(USERS_COLLECTION.doc(`${uid}/${GROUPS}/${groupId}`).delete())
+        return Promise.all(promises)
+    })
+
+// watch for changing token
 exports.setTokenInGroups = functions.firestore.document(`${USERS}/{uid}`)
     .onWrite(async (change, context) => {
         const document = change.after.exists ? change.after.data() : null;
-        const oldDocument = change.before.data()
-        const token = document.token || null
-        if (token === oldDocument.token) return Promise.resolve()
-        const db = admin.firestore()
+        const oldDocument = change.before.exists ? change.before.data() : null;
+        if (document && oldDocument && oldDocument.token === document.token) { return 0 }
+
+        let token = null
+        if (document) { token = document.token }
+
         const uid = context.params.uid
         const promises = []
-        const groups = await db.collection(`${USERS}/${uid}/${GROUPS}`).get()
-        groups.forEach(doc => {
-            const groupId = doc.id
-            const ref = db.doc(`${GROUPS}/${groupId}/${TOKENS}/${uid}`)
-            promises.push(ref.set(token), { merge: true }) // "pause" may be present
+        const groups = await USERS_COLLECTION.doc(uid).collection(GROUPS).get()
+        groups.forEach(groupUsr => {
+            const groupId = groupUsr.id
+            const ref = GROUPS_COLLECTION.doc(`${groupId}/${TOKENS}/${uid}`)
+            if (token) {
+                promises.push(ref.set({ token: token }))
+                console.log("set token in group " + groupId + '  uid: ' + uid)
+            } else {
+                promises.push(ref.delete())
+                console.log("delete token in group " + groupId + '  uid: ' + uid)
+            }
         })
         return Promise.all(promises)
     })
 
 // 8
-exports.changeGroupNameInUsers = functions.firestore.document(`${GROUPS}/{groupId}`)
+exports.changeGroupName = functions.firestore.document(`${GROUPS}/{groupId}`)
     .onUpdate(async (change, context) => {
         const document = change.after.exists ? change.after.data() : null;
         const oldDocument = change.before.exists ? change.before.data() : null;
-        if (document.groupName === oldDocument.groupName) { return 0 }
+        if (document.name === oldDocument.name) { return 0 }
         const groupId = context.params.groupId
-        const db = admin.firestore()
-        const users = await db.collection(`${GROUPS}/${groupId}/${USERS}`).get();
+
+        const users = await GROUPS_COLLECTION.doc(groupId).collection(USERS).get();
         const promises = []
         users.forEach(user => {
             const uid = user.id;
-            const ref = db.doc(`${USERS}/${uid}/${GROUPS}/${groupId}`)
-            promises.push(ref.set({ groupName: document.groupName }, { merge: true }))
+            const ref = USERS_COLLECTION.doc(`${uid}/${GROUPS}/${groupId}`)
+            promises.push(ref.set({ name: document.name }, { merge: true }))
         })
         return Promise.all(promises)
     })
 
-// 5              
+// send NOTIFICATIONS to update position
 exports.sendNotfications = functions.firestore.document(`${REQUESTS}/{groupId}`)
-    .onUpdate(async (change, context) => {
-        const document = change.after.data()
+    .onWrite(async (change, context) => {
+        const document = change.after.exists ? change.after.data() : null;
+        if (document === null) return
         const groupId = context.params.groupId
-        const payload = {
-            data: {
-                groupId: groupId,
-                request: "updatePosition",
-                name: document.name
-            }
+        const docs = await GROUPS_COLLECTION.doc(groupId).collection(TOKENS).get()
+        console.log('send notif to group ' + groupId + ' users: ' + docs.size)
+        if (docs.size === 0) {
+            console.log('There are no notification tokens to send to.')
+            return
         }
-        let tokensToNotify = []
-        let uidsToNotify = []
-        const docs = await admin.firestore().collection(`${GROUPS}/${groupId}/${TOKENS}`).get()
+        let requestTime = document.time.toMillis().toString()
+        let mapUidToken = new Map();
+        let promises = []
+
         docs.forEach(doc => {
             const token = doc.data().token
-            const paused = doc.data().pause
-            const uid = doc.id
-            if (token && !paused) {
-                tokensToNotify.push(token)
-                uidsToNotify.push(uid)
+            const toUid = doc.id
+            mapUidToken.set(toUid, token)
+
+            let payload = {
+                data: {
+                    group: groupId,
+                    reqPos: requestTime,
+                    uid: toUid
+                }
             }
+            const response = admin.messaging()
+                .sendToDevice(token, payload, { priority: "high" })
+            console.log("send notif to uid: " + toUid) // + "\n token: " + token)
+            promises.push(response)
         })
-        if (tokensToNotify.length > 0) {
-            const response = await admin.messaging()
-                .sendToDevice(tokensToNotify, payload, { priority: "high" })
-            return cleanupTokens(response, tokensToNotify, uidsToNotify)
-        }
-        return 0
+        const responses = await Promise.all(promises)
+        await cleanupTokens(responses, mapUidToken)
+        return
     })
 
-async function getUserData(uid) {
-    const user = await admin.auth().getUser(uid)
-    const name = user.displayName || user.email
-    const photoUrl = user.photoURL || ""
-    const userData = { name: name, photoUrl: photoUrl }
-    return userData
-}
-
-function cleanupTokens(response, tokens, uids) {
-    console.log("cleanup invalid tokens")
-    const tokensDelete = [];
-    response.results.forEach((result, index) => {
-        const error = result.error;
+function cleanupTokens(responses, mapUidToken) {
+    const tokensToRemove = [];
+    responses.forEach((response, index) => {
+        // console.log("cleanup tokens responses: " + JSON.stringify(response))
+        const error = response.results[0].error
         if (error) {
-            const token = tokens[index];
-            const uid = uids[index]
-            console.error('Failure sending notification to token ', `${token}`, error);
+            console.error('Failure sending notification to token ', `${mapUidToken[index].value}`, error)
             if (error.code === 'messaging/invalid-registration-token' ||
                 error.code === 'messaging/registration-token-not-registered') {
-                const deleteTask = admin.firestore().doc(`${USERS}/${uid}`)
+                const uid = mapUidToken[index].key
+                const deletePromise = admin.firestore().doc(`${USERS}/${uid}`)
                     .update({ token: admin.firestore.FieldValue.delete() })
-                tokensDelete.push(deleteTask);
+                tokensToRemove.push(deletePromise)
             }
         }
-    });
-    return Promise.all(tokensDelete);
+    })
+    return Promise.all(tokensToRemove)
 }
 
 exports.deleteDB = functions.https.onRequest(async (request, result) => {
-    try {
-           const db = admin.firestore()
+    const db = admin.firestore()
+    let promises = []
     let snapUsers = await db.collection(USERS).listDocuments()
     snapUsers.forEach(async (doc) => {
-        await deleteCollection(`${USERS}/${doc.id}/${GROUPS}`)
-        await deleteCollection(`${USERS}/${doc.id}/${TOKENS}`)
+        promises.push(deleteCollection(`${USERS}/${doc.id}/${GROUPS}`))
+        promises.push(deleteCollection(`${USERS}/${doc.id}/${TOKENS}`))
     })
     let snapGroups = await db.collection(`${GROUPS}`).listDocuments()
     snapGroups.forEach(async (doc) => {
-        // if (doc.id === "defaultGroup") { return }
-        await deleteCollection(`${GROUPS}/${doc.id}/${USERS}`)
-        await deleteCollection(`${GROUPS}/${doc.id}/${TOKENS}`)
-        await deleteCollection(`${GROUPS}/${doc.id}/banned`)
+        // if (doc.id === DEFAULT_GROUP) { return }
+        promises.push(deleteCollection(`${GROUPS}/${doc.id}/${USERS}`))
+        promises.push(deleteCollection(`${GROUPS}/${doc.id}/${TOKENS}`))
+        promises.push(deleteCollection(`${GROUPS}/${doc.id}/banned`))
     })
-    await deleteCollection(`${GROUPS}`)
-    await deleteCollection(`${REQUESTS}`)
-    await deleteCollection(`${USERS}`)
-    return result.status(200).send("success") 
+    promises.push(deleteCollection(`${REQUESTS}`))
+    promises.push(deleteCollection(`${GROUPS}`))
+    promises.push(deleteCollection(`${USERS}`))
+    promises.push(deleteCollection(`group_share_keys`))
+
+    try {
+        const results = await Promise.all(promises)
+        return result.status(200).send("success deleting groups and users")
     } catch (error) {
-      return  result.status(403).send(error)
+        return result.status(403).send(error)
+    }
+})
+exports.sendNotif = functions.https.onRequest(async (request, result) => {
+    const db = admin.firestore()
+    let promises = []
+
+    let payload = {
+        data: {
+            msg: "hi 2"
+        }
+    }
+    const token_moto = "_c7NMx0Ewk94:APA91bFIpWJ7ooRNOQ1YAMqtpfC1UwFQZDX9OdFTIpikuxvOA7Lf96u9U4W2TLJH2Gj5lXMblP1Bx6YI_xTLXzlg4hFEEQ6QO8l3JhReTRyZWO3IBYXgLW2A2Vlt2IFAo5MDzUdvbtE-"
+    const token_pixi = "d5HAjC2bGX0:APA91bGC9i6O6pNkiNGD_cHoQ1XHJf4k9GgbkOMivM6cQZWBgc9v7kDita4MV_OpHNcRxKQhwNbgOo-S5TGG3AKhk30guSMUlddL6edAbhEPlmugwmcNtRmGgWzIsQCitxxLhtucKG7U"
+    const response_moto = admin.messaging().sendToDevice(token_moto, payload, { priority: "high" })
+    const response_pixi = admin.messaging().sendToDevice(token_pixi, payload, { priority: "high" })
+    promises.push(response_moto)
+    promises.push(response_pixi)
+
+
+    try {
+        const results = await Promise.all(promises)
+        const resStr = JSON.stringify(results)
+        return result.status(200).send(resStr)
+    } catch (error) {
+        return result.status(403).send(error)
     }
 })
 
 function deleteCollection(collectionPath) {
     console.log(`deleteCollection() path: ${collectionPath} `)
-    const db = admin.firestore();
     const batchSize = 10
     let query = db.collection(collectionPath).orderBy('__name__').limit(batchSize);
     return new Promise((resolve, reject) => {
-        deleteQueryBatch(db, query, batchSize, resolve, reject);
+        deleteQueryBatch(query, batchSize, resolve, reject);
     })
 }
 
-function deleteQueryBatch(db, query, batchSize, resolve, reject) {
+function deleteQueryBatch(query, batchSize, resolve, reject) {
     query.get()
         .then((snapshot) => {
             // When there are no documents left, we are done
@@ -168,6 +223,7 @@ function deleteQueryBatch(db, query, batchSize, resolve, reject) {
             // Delete documents in a batch
             let batch = db.batch();
             snapshot.docs.forEach((doc) => {
+                // if (doc.id === DEFAULT_GROUP) { return }
                 batch.delete(doc.ref);
             });
 
@@ -183,10 +239,22 @@ function deleteQueryBatch(db, query, batchSize, resolve, reject) {
             // Recurse on the next process tick, to avoid
             // exploding the stack.
             process.nextTick(() => {
-                deleteQueryBatch(db, query, batchSize, resolve, reject);
+                deleteQueryBatch(query, batchSize, resolve, reject);
             });
             resolve();
             return
         })
         .catch(reject);
+}
+
+async function getUserData(uid) {
+    const user = await admin.auth().getUser(uid)
+    const name = user.displayName || user.email
+
+    const userData = { name: name }
+    if (user.photoURL) {
+        userData.img = user.photoURL
+    }
+
+    return userData
 }
